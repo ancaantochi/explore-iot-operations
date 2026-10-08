@@ -1,0 +1,179 @@
+name: "Publish AI Agent and Relay to GHCR"
+
+on:
+  workflow_dispatch:
+    inputs:
+      sourceRef:
+        description: "Azure-NBC branch, tag, or commit to build"
+        required: true
+        default: "main"
+        type: string
+      imageTag:
+        description: "Image tag to publish (for example, latest or 1.0.0)"
+        required: true
+        default: "latest"
+        type: string
+      chartVersion:
+        description: "Helm chart SemVer version (for example, 1.0.0 or 1.0.0-rc.1; no build metadata)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: "${{ github.workflow }}"
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate inputs and credentials
+        env:
+          SOURCE_REF: "${{ inputs.sourceRef }}"
+          IMAGE_TAG: "${{ inputs.imageTag }}"
+          CHART_VERSION: "${{ inputs.chartVersion }}"
+          SOURCE_TOKEN: "${{ secrets.AZURE_NBC_READ_TOKEN }}"
+          CARGO_TOKEN: "${{ secrets.AIO_SDKS_CARGO_TOKEN }}"
+        run: |
+          if [[ ! "$SOURCE_REF" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]]; then
+            echo "::error::sourceRef must be a branch, tag, or commit, not a ref expression."
+            exit 1
+          fi
+          if [[ ! "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
+            echo "::error::imageTag must be a valid Docker tag (1-128 characters)."
+            exit 1
+          fi
+          number='(0|[1-9][0-9]*)'
+          identifier='(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)'
+          if [[ ! "$CHART_VERSION" =~ ^$number\.$number\.$number(-$identifier(\.$identifier)*)?$ ]]; then
+            echo "::error::chartVersion must be a SemVer version without build metadata."
+            exit 1
+          fi
+          if [[ -z "$SOURCE_TOKEN" || -z "$CARGO_TOKEN" ]]; then
+            echo "::error::Configure AZURE_NBC_READ_TOKEN and AIO_SDKS_CARGO_TOKEN repository secrets."
+            exit 1
+          fi
+
+      - name: Fetch Azure-NBC source
+        id: source
+        env:
+          SOURCE_REF: "${{ inputs.sourceRef }}"
+          SOURCE_TOKEN: "${{ secrets.AZURE_NBC_READ_TOKEN }}"
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          source_dir="$RUNNER_TEMP/azure-nbc"
+          git init "$source_dir"
+          git -C "$source_dir" remote add origin https://dev.azure.com/msazure/One/_git/Azure-NBC
+          authorization="$(printf ':%s' "$SOURCE_TOKEN" | base64 -w0)"
+          echo "::add-mask::$authorization"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0=http.https://dev.azure.com/.extraheader \
+          GIT_CONFIG_VALUE_0="Authorization: Basic $authorization" \
+            git -C "$source_dir" fetch --depth=1 origin "$SOURCE_REF"
+          git -C "$source_dir" checkout --detach FETCH_HEAD
+          printf 'sha=%s\n' "$(git -C "$source_dir" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up build tools
+        working-directory: "${{ runner.temp }}/azure-nbc"
+        run: |
+          source ci/minimal-deps.sh
+          sudo apt-get install -y python3-yaml
+
+      - uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.18.4
+
+      - name: Prepare Helm packages
+        working-directory: "${{ runner.temp }}/azure-nbc"
+        env:
+          CHART_VERSION: "${{ inputs.chartVersion }}"
+          SOURCE_SHA: "${{ steps.source.outputs.sha }}"
+        run: |
+          chart_root="$RUNNER_TEMP/ai-charts"
+          package_dir="$RUNNER_TEMP/ai-chart-packages"
+          cp -a distrib/helm/AI "$chart_root"
+          mkdir -p "$package_dir"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import yaml
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "ai-charts"
+          registry = "ghcr.io/" + os.environ["GITHUB_REPOSITORY"].lower()
+          tag = "sha-" + os.environ["SOURCE_SHA"]
+          for chart, component in (("META", "agent"), ("AIO-AI-RELAY", "relay")):
+              path = root / chart / "values.yaml"
+              values = yaml.safe_load(path.read_text())
+              image = values["agent"]["image"] if component == "agent" else values["image"]
+              image.update(containerRegistry=registry, repository=f"aio-ai-{component}", tag=tag)
+              path.write_text(yaml.safe_dump(values, sort_keys=False))
+          PY
+          helm dependency update "$chart_root/K8S-MCP" --skip-refresh
+          helm dependency update "$chart_root/META" --skip-refresh
+          for chart in META AIO-AI-RELAY; do
+            helm lint "$chart_root/$chart"
+            helm package "$chart_root/$chart" \
+              --version "$CHART_VERSION" --app-version "sha-$SOURCE_SHA" \
+              --destination "$package_dir"
+          done
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: "${{ github.actor }}"
+          password: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Build and push agent and relay
+        working-directory: "${{ runner.temp }}/azure-nbc"
+        env:
+          IMAGE_TAG: "${{ inputs.imageTag }}"
+          SOURCE_SHA: "${{ steps.source.outputs.sha }}"
+          CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS: "cargo:token"
+          CARGO_REGISTRIES_AIO_SDKS_TOKEN: "${{ secrets.AIO_SDKS_CARGO_TOKEN }}"
+          CARGO_REGISTRIES_AZURE_IOT_OPERATIONS_TOKEN: "${{ secrets.AIO_SDKS_CARGO_TOKEN }}"
+          PUSH: "1"
+          RELEASE: "1"
+          STRIP: "1"
+        run: |
+          namespace="${GITHUB_REPOSITORY,,}"
+          export TAGS="ghcr.io/$namespace/{{repository}}:$IMAGE_TAG ghcr.io/$namespace/{{repository}}:sha-$SOURCE_SHA"
+          for component in agent relay; do
+            export MANIFEST="ai/$component/Cargo.toml"
+            make image
+            repository="$(ci/metadata.sh "$MANIFEST" | jq -er '.repository')"
+            {
+              printf '### %s\n\n' "$repository"
+              printf -- '- `ghcr.io/%s/%s:%s`\n' "$namespace" "$repository" "$IMAGE_TAG"
+              printf -- '- `ghcr.io/%s/%s:sha-%s`\n' "$namespace" "$repository" "$SOURCE_SHA"
+              printf '\nAzure-NBC commit: `%s`\n' "$SOURCE_SHA"
+            } >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Log in to GHCR for Helm
+        env:
+          GHCR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          printf '%s' "$GHCR_TOKEN" |
+            helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push agent and relay Helm charts
+        env:
+          CHART_VERSION: "${{ inputs.chartVersion }}"
+        run: |
+          namespace="${GITHUB_REPOSITORY,,}"
+          for chart in aio-ai-agent aio-ai-relay; do
+            helm push "$RUNNER_TEMP/ai-chart-packages/$chart-$CHART_VERSION.tgz" \
+              "oci://ghcr.io/$namespace/helm"
+            printf -- '- Helm: `oci://ghcr.io/%s/helm/%s` (version `%s`)\n' \
+              "$namespace" "$chart" "$CHART_VERSION" >> "$GITHUB_STEP_SUMMARY"
+          done
