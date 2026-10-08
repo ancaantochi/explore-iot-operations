@@ -3,19 +3,20 @@ name: "Publish AI Agent and Relay to GHCR"
 on:
   workflow_dispatch:
     inputs:
-      sourceRef:
-        description: "Azure-NBC branch, tag, or commit to build"
+      sourceRegistry:
+        description: "Source registry host (no scheme or path); anonymous pulls"
         required: true
-        default: "main"
+        default: "mqbuilds.azurecr.io"
         type: string
       imageTag:
-        description: "Image tag to publish (for example, latest or 1.0.0)"
+        description: "Existing agent and relay image tag to copy (also the destination tag)"
         required: true
-        default: "latest"
+        default: "1.0.0"
         type: string
       chartVersion:
-        description: "Helm chart SemVer version (for example, 1.0.0 or 1.0.0-rc.1; no build metadata)"
+        description: "Existing Helm chart version to copy unchanged (also the destination version)"
         required: true
+        default: "1.0.0"
         type: string
 
 permissions:
@@ -29,21 +30,20 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
+    env:
+      SOURCE_REGISTRY: "${{ inputs.sourceRegistry }}"
+      IMAGE_TAG: "${{ inputs.imageTag }}"
+      CHART_VERSION: "${{ inputs.chartVersion }}"
     steps:
-      - name: Validate inputs and credentials
-        env:
-          SOURCE_REF: "${{ inputs.sourceRef }}"
-          IMAGE_TAG: "${{ inputs.imageTag }}"
-          CHART_VERSION: "${{ inputs.chartVersion }}"
-          SOURCE_TOKEN: "${{ secrets.AZURE_NBC_READ_TOKEN }}"
-          CARGO_TOKEN: "${{ secrets.AIO_SDKS_CARGO_TOKEN }}"
+      - name: Validate inputs
         run: |
-          if [[ ! "$SOURCE_REF" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]]; then
-            echo "::error::sourceRef must be a branch, tag, or commit, not a ref expression."
+          label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
+          if [[ ! "$SOURCE_REGISTRY" =~ ^$label(\.$label)+(:[0-9]{1,5})?$ ]]; then
+            echo "::error::sourceRegistry must be a lowercase registry hostname, optionally with a port, without a scheme or path."
             exit 1
           fi
           if [[ ! "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]]; then
@@ -52,128 +52,74 @@ jobs:
           fi
           number='(0|[1-9][0-9]*)'
           identifier='(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)'
-          if [[ ! "$CHART_VERSION" =~ ^$number\.$number\.$number(-$identifier(\.$identifier)*)?$ ]]; then
-            echo "::error::chartVersion must be a SemVer version without build metadata."
+          if [[ ! "$CHART_VERSION" =~ ^$number\.$number\.$number(-$identifier(\.$identifier)*)?$ ]] \
+            || (( ${#CHART_VERSION} > 128 )); then
+            echo "::error::chartVersion must be SemVer without build metadata, at most 128 characters."
             exit 1
           fi
-          if [[ -z "$SOURCE_TOKEN" || -z "$CARGO_TOKEN" ]]; then
-            echo "::error::Configure AZURE_NBC_READ_TOKEN and AIO_SDKS_CARGO_TOKEN repository secrets."
-            exit 1
-          fi
+          umask 077
+          # Keep source pulls anonymous even if the source host is ghcr.io.
+          SOURCE_AUTH_FILE="$RUNNER_TEMP/ai-source-auth.json"
+          printf '{"auths":{}}\n' > "$SOURCE_AUTH_FILE"
+          printf 'SOURCE_AUTH_FILE=%s\n' "$SOURCE_AUTH_FILE" >> "$GITHUB_ENV"
+          printf 'DEST_AUTH_FILE=%s/ai-ghcr-auth.json\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
 
-      - name: Fetch Azure-NBC source
-        id: source
-        env:
-          SOURCE_REF: "${{ inputs.sourceRef }}"
-          SOURCE_TOKEN: "${{ secrets.AZURE_NBC_READ_TOKEN }}"
-          GIT_TERMINAL_PROMPT: "0"
-        run: |
-          source_dir="$RUNNER_TEMP/azure-nbc"
-          git init "$source_dir"
-          git -C "$source_dir" remote add origin https://dev.azure.com/msazure/One/_git/Azure-NBC
-          authorization="$(printf ':%s' "$SOURCE_TOKEN" | base64 -w0)"
-          echo "::add-mask::$authorization"
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0=http.https://dev.azure.com/.extraheader \
-          GIT_CONFIG_VALUE_0="Authorization: Basic $authorization" \
-            git -C "$source_dir" fetch --depth=1 origin "$SOURCE_REF"
-          git -C "$source_dir" checkout --detach FETCH_HEAD
-          printf 'sha=%s\n' "$(git -C "$source_dir" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      - name: Set up build tools
-        working-directory: "${{ runner.temp }}/azure-nbc"
-        run: |
-          source ci/minimal-deps.sh
-          sudo apt-get install -y python3-yaml
-
-      - uses: azure/setup-helm@v4.3.0
+      - uses: oras-project/setup-oras@22ce207df3b08e061f537244349aac6ae1d214f6 # v1
         with:
-          version: v3.18.4
+          version: 1.3.0
 
-      - name: Prepare Helm packages
-        working-directory: "${{ runner.temp }}/azure-nbc"
-        env:
-          CHART_VERSION: "${{ inputs.chartVersion }}"
-          SOURCE_SHA: "${{ steps.source.outputs.sha }}"
+      - name: Resolve all source artifacts before publishing
         run: |
-          chart_root="$RUNNER_TEMP/ai-charts"
-          package_dir="$RUNNER_TEMP/ai-chart-packages"
-          cp -a distrib/helm/AI "$chart_root"
-          mkdir -p "$package_dir"
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          import yaml
-
-          root = Path(os.environ["RUNNER_TEMP"]) / "ai-charts"
-          registry = "ghcr.io/" + os.environ["GITHUB_REPOSITORY"].lower()
-          tag = "sha-" + os.environ["SOURCE_SHA"]
-          for chart, component in (("META", "agent"), ("AIO-AI-RELAY", "relay")):
-              path = root / chart / "values.yaml"
-              values = yaml.safe_load(path.read_text())
-              image = values["agent"]["image"] if component == "agent" else values["image"]
-              image.update(containerRegistry=registry, repository=f"aio-ai-{component}", tag=tag)
-              path.write_text(yaml.safe_dump(values, sort_keys=False))
-          PY
-          helm dependency update "$chart_root/K8S-MCP" --skip-refresh
-          helm dependency update "$chart_root/META" --skip-refresh
-          for chart in META AIO-AI-RELAY; do
-            helm lint "$chart_root/$chart"
-            helm package "$chart_root/$chart" \
-              --version "$CHART_VERSION" --app-version "sha-$SOURCE_SHA" \
-              --destination "$package_dir"
+          manifest_list="$RUNNER_TEMP/ai-artifacts.tsv"
+          : > "$manifest_list"
+          for repository in aio-ai-agent aio-ai-relay helm/aio-ai-agent helm/aio-ai-relay; do
+            tag="$IMAGE_TAG"
+            if [[ "$repository" == helm/* ]]; then
+              tag="$CHART_VERSION"
+            fi
+            digest="$(oras manifest fetch --registry-config "$SOURCE_AUTH_FILE" \
+              --descriptor "$SOURCE_REGISTRY/$repository:$tag" | jq -er '.digest')"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid source digest for $repository:$tag."
+              exit 1
+            fi
+            printf '%s\t%s\t%s\n' "$repository" "$tag" "$digest" >> "$manifest_list"
           done
-
-      - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: "${{ github.actor }}"
-          password: "${{ secrets.GITHUB_TOKEN }}"
-
-      - name: Build and push agent and relay
-        working-directory: "${{ runner.temp }}/azure-nbc"
-        env:
-          IMAGE_TAG: "${{ inputs.imageTag }}"
-          SOURCE_SHA: "${{ steps.source.outputs.sha }}"
-          CARGO_REGISTRY_GLOBAL_CREDENTIAL_PROVIDERS: "cargo:token"
-          CARGO_REGISTRIES_AIO_SDKS_TOKEN: "${{ secrets.AIO_SDKS_CARGO_TOKEN }}"
-          CARGO_REGISTRIES_AZURE_IOT_OPERATIONS_TOKEN: "${{ secrets.AIO_SDKS_CARGO_TOKEN }}"
-          PUSH: "1"
-          RELEASE: "1"
-          STRIP: "1"
-        run: |
-          namespace="${GITHUB_REPOSITORY,,}"
-          export TAGS="ghcr.io/$namespace/{{repository}}:$IMAGE_TAG ghcr.io/$namespace/{{repository}}:sha-$SOURCE_SHA"
-          for component in agent relay; do
-            export MANIFEST="ai/$component/Cargo.toml"
-            make image
-            repository="$(ci/metadata.sh "$MANIFEST" | jq -er '.repository')"
-            {
-              printf '### %s\n\n' "$repository"
-              printf -- '- `ghcr.io/%s/%s:%s`\n' "$namespace" "$repository" "$IMAGE_TAG"
-              printf -- '- `ghcr.io/%s/%s:sha-%s`\n' "$namespace" "$repository" "$SOURCE_SHA"
-              printf '\nAzure-NBC commit: `%s`\n' "$SOURCE_SHA"
-            } >> "$GITHUB_STEP_SUMMARY"
-          done
-
-      - name: Log in to GHCR for Helm
         env:
           GHCR_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
         run: |
           printf '%s' "$GHCR_TOKEN" |
-            helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+            oras login ghcr.io --registry-config "$DEST_AUTH_FILE" \
+              --username "$GITHUB_ACTOR" --password-stdin
 
-      - name: Push agent and relay Helm charts
-        env:
-          CHART_VERSION: "${{ inputs.chartVersion }}"
+      # Copy charts byte-for-byte: their image defaults and bundled dependencies
+      # remain unchanged. Supply GHCR image overrides when installing if needed.
+      - name: Copy and verify images and Helm charts
         run: |
           namespace="${GITHUB_REPOSITORY,,}"
-          for chart in aio-ai-agent aio-ai-relay; do
-            helm push "$RUNNER_TEMP/ai-chart-packages/$chart-$CHART_VERSION.tgz" \
-              "oci://ghcr.io/$namespace/helm"
-            printf -- '- Helm: `oci://ghcr.io/%s/helm/%s` (version `%s`)\n' \
-              "$namespace" "$chart" "$CHART_VERSION" >> "$GITHUB_STEP_SUMMARY"
-          done
+          while IFS=$'\t' read -r repository tag digest; do
+            source="$SOURCE_REGISTRY/$repository@$digest"
+            destination="ghcr.io/$namespace/$repository:$tag"
+            # Includes every platform and OCI referrers, such as signatures/SBOMs.
+            oras cp --recursive --from-registry-config "$SOURCE_AUTH_FILE" \
+              --to-registry-config "$DEST_AUTH_FILE" "$source" "$destination"
+            actual="$(oras manifest fetch --registry-config "$DEST_AUTH_FILE" \
+              --descriptor "$destination" | jq -er '.digest')"
+            if [[ "$actual" != "$digest" ]]; then
+              echo "::error::Destination digest mismatch for $destination."
+              exit 1
+            fi
+            printf -- '- `%s` copied from `%s` (digest verified)\n' \
+              "$destination" "$source" >> "$GITHUB_STEP_SUMMARY"
+          done < "$RUNNER_TEMP/ai-artifacts.tsv"
+          {
+            printf '\nCharts retain upstream image defaults; override them at install time to use GHCR.\n'
+            printf 'Copied signatures may require a destination-specific trust policy or re-signing.\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove registry credentials
+        if: always()
+        run: |
+          rm -f -- "$RUNNER_TEMP/ai-source-auth.json" "$RUNNER_TEMP/ai-ghcr-auth.json"
