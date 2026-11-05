@@ -27,8 +27,12 @@ Authentication:
                                       Existing names are rejected; no app is reused or deleted.
   --entra-app-id <client-id>         Use a manually configured existing Entra app; no Graph calls.
   --entra-tenant-id <tenant-id>      Required with --entra-app-id. Both must be GUIDs.
-                                      Cannot combine with --entra-app-name or --entra-azure-config-dir.
+                                      Cannot combine with --entra-app-name, --entra-azure-config-dir,
+                                      or --service-management-reference.
   --entra-app-scope <scope-name>     Delegated scope to create or advertise. Default: mcp.access.
+  --service-management-reference <reference>
+                                    Optional tenant-approved service or asset management reference
+                                      for a new Entra app. Does not grant registration permissions.
   --entra-azure-config-dir <dir>     Optional isolated Azure CLI profile for app registration.
                                       Default: current Azure CLI profile. Tenant policies still apply.
                                       If the isolated profile has no active session, prompts for login.
@@ -79,6 +83,7 @@ ROLE_ID=""
 ENTRA_AZURE_CONFIG_DIR=""
 ENTRA_APP_ROLE="AIOMcpAdmin"
 ENTRA_APP_SCOPE="mcp.access"
+SERVICE_MANAGEMENT_REFERENCE=""
 ENDPOINT_PROTOCOL="mcp"
 ENDPOINT_URL=""
 MCP_FRONTEND_SERVICE_NAME="aio-mcp-frontend"
@@ -101,6 +106,7 @@ while [[ $# -gt 0 ]]; do
         --resource-group|--relay-namespace-name|--apim-name|--apim-publisher-email|--apim-publisher-name|\
         --chart-version|--chart-reference|--auth-mode|--cluster-name|--aio-extension-name|\
         --entra-app-name|--entra-app-id|--entra-tenant-id|--entra-app-scope|--entra-azure-config-dir|--endpoint-protocol|--endpoint-url|\
+        --service-management-reference|\
         --mcp-frontend-service-name|--mcp-frontend-audience|--mcp-role|--image-tag|--values|\
         --hybrid-connection-name|--apim-sku|--apim-capacity|--k8s-namespace|--helm-release-name)
             if [[ $# -lt 2 || ! "${2:-}" =~ [^[:space:]] || "${2:-}" == --* ]]; then
@@ -124,6 +130,7 @@ while [[ $# -gt 0 ]]; do
         --entra-app-id) ENTRA_APP_ID="$2" ;;
         --entra-tenant-id) ENTRA_TENANT_ID="$2" ;;
         --entra-app-scope) ENTRA_APP_SCOPE="$2" ;;
+        --service-management-reference) SERVICE_MANAGEMENT_REFERENCE="$2" ;;
         --entra-azure-config-dir) ENTRA_AZURE_CONFIG_DIR="$2" ;;
         --endpoint-protocol) ENDPOINT_PROTOCOL="$2" ;;
         --endpoint-url) ENDPOINT_URL="$2" ;;
@@ -152,8 +159,8 @@ if [[ -n "$ENTRA_APP_ID" || -n "$ENTRA_TENANT_ID" ]]; then
         echo "Error: --entra-app-id and --entra-tenant-id must both be supplied as GUIDs." >&2
         exit 1
     fi
-    if [[ -n "$ENTRA_APP_NAME" || -n "$ENTRA_AZURE_CONFIG_DIR" ]]; then
-        echo "Error: existing-app IDs cannot be combined with --entra-app-name or --entra-azure-config-dir." >&2
+    if [[ -n "$ENTRA_APP_NAME" || -n "$ENTRA_AZURE_CONFIG_DIR" || -n "$SERVICE_MANAGEMENT_REFERENCE" ]]; then
+        echo "Error: existing-app IDs cannot be combined with --entra-app-name, --entra-azure-config-dir, or --service-management-reference." >&2
         exit 1
     fi
 fi
@@ -289,7 +296,11 @@ if [[ -z "$ENTRA_APP_ID" ]]; then
         echo "Error: an Entra app named '$ENTRA_APP_NAME' already exists. Use a different --entra-app-name." >&2
         exit 1
     fi
-    ENTRA_APP_JSON="$(az_entra ad app create --display-name "$ENTRA_APP_NAME" -o json)"
+    ENTRA_APP_CREATE_ARGS=(--display-name "$ENTRA_APP_NAME")
+    if [[ -n "$SERVICE_MANAGEMENT_REFERENCE" ]]; then
+        ENTRA_APP_CREATE_ARGS+=(--service-management-reference "$SERVICE_MANAGEMENT_REFERENCE")
+    fi
+    ENTRA_APP_JSON="$(az_entra ad app create "${ENTRA_APP_CREATE_ARGS[@]}" -o json)"
     ENTRA_APP_ID="$(jq -er '.appId | if type == "string" and length > 0 then . else error("Expected an Entra appId") end' <<< "$ENTRA_APP_JSON")"
     echo "==> Created Entra app '$ENTRA_APP_ID' in tenant '$ENTRA_TENANT_ID'; retain this ID for cleanup."
     ENTRA_SP_JSON="$(az_entra ad sp create --id "$ENTRA_APP_ID" -o json)"

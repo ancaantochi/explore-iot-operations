@@ -62,8 +62,13 @@ kubectl config current-context
 Do not use another account or tenant to bypass organization policies. If app
 registration is blocked, resolve the requirements with your Entra administrator.
 For example, a tenant requiring `serviceManagementReference` cannot use the
-sample's basic app-creation command without an approved adaptation. The script
-stops on that error; it does not fall back to anonymous access.
+default app-creation command without that metadata. Add
+`--service-management-reference '<approved-service-reference>'` when creating a
+new app, using the reference approved by your organization. The script doesn't
+infer or supply an organization-specific reference. This option sets registration
+metadata; it doesn't grant permissions or bypass tenant policy. If you can't
+register an app, have an administrator [configure one beforehand](#use-a-manually-configured-app).
+The script stops on registration errors; it doesn't fall back to anonymous access.
 
 ## Deploy MCP access
 
@@ -145,7 +150,9 @@ If an administrator has already configured the API application, replace
 
 Both values must be GUIDs, not an `api://` URI or display name. This mode makes
 no Microsoft Graph calls and does not validate, modify, or delete the app.
-It cannot be combined with `--entra-app-name` or `--entra-azure-config-dir`.
+It cannot be combined with `--entra-app-name`, `--entra-azure-config-dir`, or
+`--service-management-reference`. The service-management reference, if required,
+must already be set by the administrator.
 Configure the identifier URI `api://<application-client-id>`, the delegated
 scope, the `AIOMcpAdmin` role for users/applications, the
 corresponding service principal, required role assignment, and approved caller
@@ -245,3 +252,10 @@ helm uninstall aio-ai-relay --namespace azure-iot-operations
 ```
 
 Run `bash samples/ai/deploy.sh --help` for all options.
+
+To run the deployment argument tests with mocked Azure CLI, Helm, and kubectl
+commands (no cloud resources are created), use Python 3:
+
+```bash
+python3 -m unittest discover -s samples/ai -p 'test_*.py'
+```
